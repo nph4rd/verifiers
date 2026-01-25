@@ -552,3 +552,107 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
 
     # print final summary after exit
     display.print_final_summary()
+
+
+def sanitize_metadata(metadata: GenerateMetadata) -> dict:
+    metadata_dict = dict(metadata)
+    metadata_dict.pop("path_to_save")
+    metadata_dict.pop("date")
+
+    return metadata_dict
+
+
+def get_hf_hub_dataset_name(results: GenerateOutputs) -> str:
+    metadata = results["metadata"]
+    dataset_name = (
+        metadata["env_id"]
+        + "_"
+        + metadata["model"].replace("/", "_")
+        + "_n"
+        + str(metadata["num_examples"])
+        + "_r"
+        + str(metadata["rollouts_per_example"])
+    )
+    return dataset_name
+
+
+def make_dataset(results: GenerateOutputs, **kwargs) -> Dataset:
+    clean_prompts = [messages_to_printable(p) for p in results["prompt"]]
+    clean_prompts = [sanitize_tool_calls(p) for p in clean_prompts]
+    clean_completions = [messages_to_printable(c) for c in results["completion"]]
+    clean_completions = [sanitize_tool_calls(c) for c in clean_completions]
+    save_info = any(info != {} for info in results["info"])
+    save_answer = any(answer != "" for answer in results["answer"])
+    errors = [s.get("error") for s in results["state"]]
+    results_dict = {
+        "example_id": results["example_id"],
+        "prompt": clean_prompts,
+        "completion": clean_completions,
+        "task": results["task"],
+        "reward": results["reward"],
+        "error": [repr(e) if e is not None else None for e in errors],
+        "generation_ms": [s["timing"]["generation_ms"] for s in results["state"]],
+        "scoring_ms": [s["timing"]["scoring_ms"] for s in results["state"]],
+        "total_ms": [s["timing"]["total_ms"] for s in results["state"]],
+    }
+    if save_info:
+        results_dict["info"] = results["info"]
+    if save_answer:
+        results_dict["answer"] = results["answer"]
+    for k in results["metrics"]:
+        v = results["metrics"][k]
+        results_dict[k] = v
+
+    # Add actor_id column for multi-agent environments
+    if "actor_id" in results and results["actor_id"]:
+        results_dict["actor_id"] = results["actor_id"]
+
+    # Add selected state columns if specified
+    state_columns = results["metadata"]["state_columns"]
+    if state_columns:
+        for col in state_columns:
+            if col == "responses":
+                results_dict[col] = [
+                    [r.model_dump() for r in s.get(col, [])] for s in results["state"]
+                ]
+            else:
+                results_dict[col] = [s.get(col) for s in results["state"]]
+
+    return Dataset.from_dict(results_dict)
+
+
+@contextmanager
+def quiet_datasets():
+    prev_level = ds_logging.get_verbosity()
+    ds_logging.set_verbosity(ds_logging.WARNING)
+    disable_progress_bar()
+    try:
+        yield
+    finally:
+        ds_logging.set_verbosity(prev_level)
+        enable_progress_bar()
+
+
+def save_to_disk(dataset: Dataset, metadata_dict: dict, path_to_save: Path):
+    path_to_save.parent.mkdir(parents=True, exist_ok=True)
+    with quiet_datasets():
+        dataset.to_json(path_to_save / "results.jsonl")
+    with open(path_to_save / "metadata.json", "w") as f:
+        json.dump(metadata_dict, f)
+
+
+def save_rollout_results(
+    results: GenerateOutputs,
+    push_to_hf_hub: bool = False,
+    hf_hub_dataset_name: str | None = None,
+):
+    path_to_save = results["metadata"]["path_to_save"]
+    path_to_save.parent.mkdir(parents=True, exist_ok=True)
+    dataset = make_dataset(results)
+    metadata_dict = sanitize_metadata(results["metadata"])
+    save_to_disk(dataset, metadata_dict, path_to_save)
+    logger.info(f"Results saved to {path_to_save}")
+    if push_to_hf_hub:
+        dataset_name = hf_hub_dataset_name or get_hf_hub_dataset_name(results)
+        dataset.push_to_hub(dataset_name)
+        logger.info(f"Dataset saved to Hugging Face Hub: {dataset_name}")
