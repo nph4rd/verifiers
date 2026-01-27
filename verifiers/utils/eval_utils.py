@@ -1,18 +1,12 @@
-from __future__ import annotations
-
 import asyncio
 import importlib.util
+import json
 import logging
-import math
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
-
-from datasets import disable_progress_bar, enable_progress_bar
-from datasets.utils import logging as ds_logging
+from typing import cast
 
 try:
     import tomllib  # type: ignore[import-not-found]
@@ -20,23 +14,26 @@ except ImportError:
     import tomli as tomllib  # type: ignore[import-not-found]
 
 import numpy as np
+from datasets import Dataset, disable_progress_bar, enable_progress_bar
+from datasets.utils import logging as ds_logging
 
 import verifiers as vf
-
-if TYPE_CHECKING:
-    pass
 from verifiers.types import (
     Endpoints,
     EvalConfig,
     EvalRunConfig,
+    GenerateMetadata,
     GenerateOutputs,
     LogCallback,
     ProgressCallback,
-    RolloutOutput,
     StartCallback,
+    State,
 )
 from verifiers.utils.async_utils import EventLoopLagMonitor
+from verifiers.utils.client_utils import setup_client
+from verifiers.utils.error_utils import ErrorChain
 from verifiers.utils.logging_utils import print_prompt_completions_sample, print_time
+from verifiers.utils.message_utils import messages_to_printable, sanitize_tool_calls
 from verifiers.utils.path_utils import get_eval_results_path
 
 logger = logging.getLogger(__name__)
@@ -145,6 +142,8 @@ def load_toml_config(path: Path) -> list[dict]:
         "num_examples",
         "rollouts_per_example",
         "max_concurrent",
+        "max_concurrent_generation",
+        "max_concurrent_scoring",
         "independent_scoring",
         "max_retries",
         # logging
@@ -182,40 +181,54 @@ def load_toml_config(path: Path) -> list[dict]:
     return merged_eval_list
 
 
-def to_col_order(list_of_dicts: list[Mapping[str, float]]) -> dict[str, list[float]]:
-    """Convert a list of mappings to a dictionary of lists, ordered by the keys of the first mapping."""
-    if not list_of_dicts:
-        return {}
-    return {k: [m[k] for m in list_of_dicts] for k in list_of_dicts[0].keys()}
+def get_results_by_task(results: GenerateOutputs) -> dict[str, GenerateOutputs]:
+    """Group results by task name.
 
+    Args:
+        results: The GenerateOutputs from an evaluation run.
 
-def get_task_outputs(results: GenerateOutputs, task: str) -> GenerateOutputs:
-    """Get only the rollouts for a given task."""
-    outputs = [o for o in results["outputs"] if o["task"] == task]
-    return GenerateOutputs(
-        outputs=outputs,
-        metadata=results["metadata"],  # duplicate metadata
-    )
+    Returns:
+        A dictionary mapping task names to their corresponding GenerateOutputs.
+    """
+    task_indices: dict[str, list[int]] = {}
+    for i, task in enumerate(results["task"]):
+        if task not in task_indices:
+            task_indices[task] = []
+        task_indices[task].append(i)
+
+    task_results: dict[str, GenerateOutputs] = {}
+    for task, indices in task_indices.items():
+        task_results[task] = GenerateOutputs(
+            prompt=[results["prompt"][i] for i in indices],
+            completion=[results["completion"][i] for i in indices],
+            answer=[results["answer"][i] for i in indices],
+            state=[results["state"][i] for i in indices],
+            task=[results["task"][i] for i in indices],
+            info=[results["info"][i] for i in indices],
+            example_id=[results["example_id"][i] for i in indices],
+            reward=[results["reward"][i] for i in indices],
+            metrics={k: [v[i] for i in indices] for k, v in results["metrics"].items()},
+            stop_conditions=[results["stop_conditions"][i] for i in indices],
+            is_truncated=[results["is_truncated"][i] for i in indices],
+            metadata=results["metadata"],
+        )
+    return task_results
 
 
 def print_rewards(results: GenerateOutputs):
-    rewards = [o["reward"] for o in results["outputs"]]
     print("Rewards:")
     print(
-        f"reward: avg - {sum(rewards) / len(rewards):.3f}, std - {np.std(rewards):.3f}"
+        f"reward: avg - {sum(results['reward']) / len(results['reward']):.3f}, std - {np.std(results['reward']):.3f}"
     )
     r = results["metadata"]["rollouts_per_example"]
-    n = len(rewards) // r
+    n = len(results["reward"]) // r
     # results are sorted by example_id, so rollout i is at indices [i, i+r, i+2r, ...]
     for i in range(r):
-        trials = [round(rewards[i + (j * r)], 3) for j in range(n)]
+        trials = [round(results["reward"][i + (j * r)], 3) for j in range(n)]
         out = f"r{i + 1}: {trials}"
         print(out)
-
-    metrics = [o["metrics"] for o in results["outputs"]]
-    metrics_col = to_col_order(metrics)
-    for k in metrics_col.keys():
-        v = metrics_col[k]
+    for k in results["metrics"]:
+        v = results["metrics"][k]
         print(f"{k}: avg - {sum(v) / len(v):.3f}, std - {np.std(v):.3f}")
         for i in range(r):
             trials = [round(v[i + (j * r)], 3) for j in range(n)]
@@ -224,36 +237,34 @@ def print_rewards(results: GenerateOutputs):
 
 
 def print_info(results: GenerateOutputs):
-    is_truncated = [o["is_truncated"] for o in results["outputs"]]
     print("Info:")
     print(
-        f"is_truncated: avg - {np.mean(is_truncated):.3f}, std - {np.std(is_truncated):.3f}"
+        f"is_truncated: avg - {np.mean(results['is_truncated']):.3f}, std - {np.std(results['is_truncated']):.3f}"
     )
-    stop_conditions = [o["stop_condition"] for o in results["outputs"]]
-    counter = Counter(stop_conditions)
+    counter = Counter(results["stop_conditions"])
     print(
         f"stop_conditions: {', '.join([f'{k}: {v / counter.total():.3f}' for k, v in counter.items()])}"
     )
-    errors = [o.get("error") for o in results["outputs"]]
+    errors = [s.get("error") for s in results["state"]]
     has_errors = [e is not None for e in errors]
     if any(has_errors):
         print(
             f"errors: avg - {np.mean(has_errors):.3f}, std - {np.std(has_errors):.3f}"
         )
-        error_chains = [e["error_chain_str"] for e in errors if e is not None]
-        # Errors are serialized as strings, count unique error types
+        errors = [e for e in errors if e is not None]
+        error_chains = [ErrorChain(e) for e in errors]
         counter = Counter(error_chains)
-        for error_str, count in counter.items():
-            print(f" - {error_str}: {count / counter.total():.3f}")
+        for error_chain, count in counter.items():
+            print(f" - {repr(error_chain)}: {count / counter.total():.3f}")
 
 
 def print_timing(results: GenerateOutputs):
     print("Timing:")
-    timing = [o["timing"] for o in results["outputs"]]
-    timing_col = to_col_order(timing)
-    generation_ms_arr = np.array(timing_col["generation_ms"])
-    scoring_ms_arr = np.array(timing_col["scoring_ms"])
-    total_ms_arr = np.array(timing_col["total_ms"])
+    generation_ms_arr = np.array(
+        [s["timing"]["generation_ms"] for s in results["state"]]
+    )
+    scoring_ms_arr = np.array([s["timing"]["scoring_ms"] for s in results["state"]])
+    total_ms_arr = np.array([s["timing"]["total_ms"] for s in results["state"]])
     generation_arr = generation_ms_arr / 1000
     scoring_arr = scoring_ms_arr / 1000
     total_arr = total_ms_arr / 1000
@@ -269,7 +280,10 @@ def print_timing(results: GenerateOutputs):
     )
 
 
-def print_results(results: GenerateOutputs, num_samples: int = 1):
+def print_results(
+    results: GenerateOutputs,
+    num_samples: int = 1,
+):
     assert results["metadata"] is not None
     print("--- Evaluation ---")
     print(f"Environment: {results['metadata']['env_id']}")
@@ -279,18 +293,14 @@ def print_results(results: GenerateOutputs, num_samples: int = 1):
     print(f"Rollouts per example: {results['metadata']['rollouts_per_example']}")
     print("--- Example ---")
 
-    # prompt/completion are already in printable format from state_to_output
-    printable_prompts = [o["prompt"] if o["prompt"] else [] for o in results["outputs"]]
-    printable_completions = [
-        o["completion"] if o["completion"] else [] for o in results["outputs"]
-    ]
-    rewards = [o["reward"] for o in results["outputs"]]
-    errors = [o.get("error") for o in results["outputs"]]
+    printable_prompts = [messages_to_printable(p) for p in results["prompt"]]
+    printable_completions = [messages_to_printable(c) for c in results["completion"]]
+    errors = [s.get("error") for s in results["state"]]
     print_prompt_completions_sample(
         printable_prompts,
         printable_completions,
         errors,
-        rewards,
+        results["reward"],
         step=0,
         num_samples=num_samples,
     )
@@ -299,26 +309,14 @@ def print_results(results: GenerateOutputs, num_samples: int = 1):
     print_info(results)
     print_timing(results)
 
-    tasks = set([o["task"] for o in results["outputs"]])
-    if len(tasks) > 1:
-        for task in tasks:
-            task_results = get_task_outputs(results, task)
+    num_tasks = len(set(results["task"]))
+    if num_tasks > 1:
+        task_results = get_results_by_task(results)
+        for task, task_results in task_results.items():
             print(f"\n--- {task} ---")
             print_rewards(task_results)
             print_info(task_results)
             print_timing(task_results)
-
-
-@contextmanager
-def quiet_datasets():
-    prev_level = ds_logging.get_verbosity()
-    ds_logging.set_verbosity(ds_logging.WARNING)
-    disable_progress_bar()
-    try:
-        yield
-    finally:
-        ds_logging.set_verbosity(prev_level)
-        enable_progress_bar()
 
 
 async def run_evaluation(
@@ -327,6 +325,12 @@ async def run_evaluation(
     on_progress: ProgressCallback | None = None,
     on_log: LogCallback | None = None,
 ) -> GenerateOutputs:
+    # set up AsyncOpenAI client with high limits to prevent timeouts
+    client = setup_client(config.client_config)
+    logger.debug(
+        f"Initialized AsyncOpenAI client with base_url: {config.client_config.api_base_url}"
+    )
+
     # load environment
     vf_env = vf.load_environment(env_id=config.env_id, **config.env_args)
 
@@ -335,52 +339,38 @@ async def run_evaluation(
         logger.info(f"Setting extra environment kwargs: {config.extra_env_kwargs}")
         vf_env.set_kwargs(**config.extra_env_kwargs)
 
-    # start env server as sidecar process
-    try:
-        await vf_env.start_server(extra_env_kwargs=config.extra_env_kwargs)
+    # run evaluation
+    results_path = get_eval_results_path(config)
+    logger.debug(f"Starting evaluation with model: {config.model}")
+    logger.debug(
+        f"Configuration: num_examples={config.num_examples}, rollouts_per_example={config.rollouts_per_example}, max_concurrent={config.max_concurrent}"
+    )
+    # disable tqdm when callbacks are provided (TUI handles progress display)
+    use_tqdm = config.use_tqdm and on_progress is None
+    results = await vf_env.evaluate(
+        client=client,
+        model=config.model,
+        sampling_args=config.sampling_args,
+        num_examples=config.num_examples,
+        rollouts_per_example=config.rollouts_per_example,
+        max_concurrent=config.max_concurrent,
+        max_concurrent_generation=config.max_concurrent_generation,
+        max_concurrent_scoring=config.max_concurrent_scoring,
+        results_path=results_path,
+        state_columns=config.state_columns,
+        save_results=config.save_results,
+        save_every=config.save_every,
+        push_to_hf_hub=config.save_to_hf_hub,
+        hf_hub_dataset_name=config.hf_hub_dataset_name,
+        use_tqdm=use_tqdm,
+        independent_scoring=config.independent_scoring,
+        max_retries=config.max_retries,
+        on_start=on_start,
+        on_progress=on_progress,
+        on_log=on_log,
+    )
 
-        # run evaluation
-        results_path = get_eval_results_path(config)
-        logger.debug(f"Starting evaluation with model: {config.model}")
-        logger.debug(
-            f"Configuration: num_examples={config.num_examples}, rollouts_per_example={config.rollouts_per_example}, max_concurrent={config.max_concurrent}"
-        )
-        # disable tqdm when callbacks are provided (TUI handles progress display)
-        use_tqdm = config.use_tqdm and on_progress is None
-        effective_max_concurrent = config.max_concurrent
-        if (
-            not config.independent_scoring
-            and config.max_concurrent > 0
-            and config.rollouts_per_example > 1
-        ):
-            effective_max_concurrent = math.ceil(
-                config.max_concurrent / config.rollouts_per_example
-            )
-
-        outputs = await vf_env.evaluate(
-            client=config.client_config,
-            model=config.model,
-            sampling_args=config.sampling_args,
-            num_examples=config.num_examples,
-            rollouts_per_example=config.rollouts_per_example,
-            max_concurrent=effective_max_concurrent,
-            results_path=results_path,
-            state_columns=config.state_columns,
-            save_results=config.save_results,
-            save_every=config.save_every,
-            push_to_hf_hub=config.save_to_hf_hub,
-            hf_hub_dataset_name=config.hf_hub_dataset_name,
-            use_tqdm=use_tqdm,
-            independent_scoring=config.independent_scoring,
-            max_retries=config.max_retries,
-            on_start=on_start,
-            on_progress=on_progress,
-            on_log=on_log,
-        )
-    finally:
-        await vf_env.stop_server()
-
-    return outputs
+    return results
 
 
 async def run_evaluations(config: EvalRunConfig) -> None:
@@ -433,64 +423,66 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
         env_config: EvalConfig, env_idx: int
     ) -> GenerateOutputs:
         """Run a single evaluation with display progress updates."""
-        reward_accum = 0
-        metrics_accum = defaultdict(float)
-        error_accum = 0
-        input_tokens_accum = 0.0
-        output_tokens_accum = 0.0
-        usage_count = 0
-        usage_seen = False
+        actor_rewards: dict[str, list[float]] = defaultdict(list)
+        metrics_values: dict[str, list[float]] = defaultdict(list)
+        error_count = 0
+        is_multiagent = False
 
         def on_start(total: int) -> None:
-            # total is num_examples * rollouts_per_example
-            # compute actual num_examples (resolves -1 to actual count)
             num_examples = total // env_config.rollouts_per_example
             display.update_env_state(env_idx, total=total, num_examples=num_examples)
 
-        def on_progress(
-            all_outputs: list[RolloutOutput], new_outputs: list[RolloutOutput]
-        ) -> None:
-            nonlocal error_accum, reward_accum, metrics_accum
-            nonlocal input_tokens_accum, output_tokens_accum, usage_seen, usage_count
+        def on_progress(all_states: list[State], new_states: list[State]) -> None:
+            nonlocal error_count, is_multiagent
+            completed = len(all_states)
 
-            # Progress is always rollout-based
-            completed = len(all_outputs)
+            for s in new_states:
+                if s.get("error") is not None:
+                    error_count += 1
 
-            for o in new_outputs:
-                if o.get("error") is not None:
-                    error_accum += 1
-                reward = o.get("reward")
+                # Track rewards per-actor
+                actor_id = s.get("extras", {}).get("current_actor_id")
+                reward = s.get("reward")
                 if reward is not None:
-                    reward_accum += reward
-                output_metrics = o.get("metrics") or {}
-                for name, value in output_metrics.items():
-                    if value is not None:
-                        metrics_accum[name] += value
-                token_usage = o.get("token_usage")
-                if isinstance(token_usage, dict):
-                    usage_seen = True
-                    usage_count += 1
-                    input_tokens_accum += float(token_usage.get("input_tokens", 0.0))
-                    output_tokens_accum += float(token_usage.get("output_tokens", 0.0))
+                    key = actor_id if actor_id else "_single"
+                    actor_rewards[key].append(reward)
+                    if actor_id:
+                        is_multiagent = True
 
-            # Compute averages over completed rollouts
-            reward = reward_accum / completed
-            metrics = {name: metrics_accum[name] / completed for name in metrics_accum}
-            error_rate = error_accum / completed
-            usage = None
-            if usage_seen and usage_count > 0:
-                usage = {
-                    "input_tokens": input_tokens_accum / usage_count,
-                    "output_tokens": output_tokens_accum / usage_count,
-                }
+                # Track metrics (skip *_reward for multi-agent, we compute those ourselves)
+                for name, value in (s.get("metrics") or {}).items():
+                    if value is not None and not (is_multiagent and name.endswith("_reward")):
+                        metrics_values[name].append(value)
+
+            # Build display values
+            metrics: dict[str, float] = {}
+
+            if is_multiagent:
+                # Multi-agent: per-actor rewards first
+                reward = 0.0
+                for aid in sorted(actor_rewards.keys()):
+                    vals = actor_rewards[aid]
+                    if vals:
+                        metrics[aid] = sum(vals) / len(vals)
+            else:
+                # Single-agent: combined reward
+                vals = actor_rewards.get("_single", [])
+                reward = sum(vals) / len(vals) if vals else 0.0
+
+            # Add other metrics
+            for name, vals in metrics_values.items():
+                if vals:
+                    metrics[name] = sum(vals) / len(vals)
+
+            error_rate = error_count / completed if completed > 0 else 0.0
 
             display.update_env_state(
                 env_idx,
                 progress=completed,
                 reward=reward,
                 metrics=metrics,
-                usage=usage,
                 error_rate=error_rate,
+                is_multiagent=is_multiagent,
             )
 
         def on_log(message: str) -> None:
@@ -522,30 +514,19 @@ async def run_evaluations_tui(config: EvalRunConfig, tui_mode: bool = True) -> N
             display.update_env_state(env_idx, status="failed", error=str(e))
             raise
 
-    async def refresh_loop() -> None:
-        while not display.state.all_completed:
-            display.refresh()
-            await asyncio.sleep(1)
-
     try:
         async with display:
-            refresh_task = asyncio.create_task(refresh_loop())
-            try:
-                await asyncio.gather(
-                    *[
-                        run_with_progress(env_config, idx)
-                        for idx, env_config in enumerate(config.evals)
-                    ],
-                    return_exceptions=True,
-                )
+            await asyncio.gather(
+                *[
+                    run_with_progress(env_config, idx)
+                    for idx, env_config in enumerate(config.evals)
+                ],
+                return_exceptions=True,
+            )
 
-                display.refresh()
-                if tui_mode:
-                    await display.wait_for_exit()
-            finally:
-                refresh_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refresh_task
+            display.refresh()
+            if tui_mode:
+                await display.wait_for_exit()
 
     except KeyboardInterrupt:
         pass  # exit on interrupt
