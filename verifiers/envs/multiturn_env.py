@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from abc import abstractmethod
 from typing import final
@@ -70,6 +69,24 @@ class MultiTurnEnv(vf.Environment):
         """Override to add environment-specific state fields."""
         return state
 
+    # -------------------------------------------------------------------------
+    # Hooks for subclasses (called by rollout loop)
+    # -------------------------------------------------------------------------
+
+    async def before_loop(self, state: State) -> None:
+        """Called once before the main loop starts. Override to set up turn state."""
+        pass
+
+    async def get_turn_sampling_args(
+        self, state: State, sampling_args: SamplingArgs
+    ) -> SamplingArgs:
+        """Called each turn. Override to modify sampling args (e.g., per-actor)."""
+        return sampling_args
+
+    async def after_turn(self, state: State) -> None:
+        """Called after each turn completes. Override to advance turn state."""
+        pass
+
     async def get_prompt_messages(self, state: State) -> Messages:
         """Override for rollouts with non-linear message sequences."""
         if len(state["trajectory"]) == 0:
@@ -136,26 +153,38 @@ class MultiTurnEnv(vf.Environment):
     ) -> State:
         state = await self.init_state(input, client, model, sampling_args)
         try:
-            try:
-                state = await self.setup_state(state)
-            except vf.Error as e:
-                state["error"] = e
-            # checks all @vf.stop methods, runs all @vf.cleanup methods if any are True
-            while not await self.is_completed(state):
-                try:
-                    prompt_messages = await self.get_prompt_messages(state)
-                    if state.get("final_env_response") is not None:
-                        continue
-                    response = await self.get_model_response(state, prompt_messages)
-                    await self.add_model_response(state, prompt_messages, response)
-                except vf.Error as e:
-                    if isinstance(e, vf.OverlongPromptError):
-                        state["prompt_too_long"] = True
-                        state["is_truncated"] = True
-                    else:
-                        state["error"] = e
-            await self.render_completion(state)
+            state = await self.setup_state(state)
+        except vf.Error as e:
+            state["error"] = e
             return state
-        except asyncio.CancelledError:
-            await self._cleanup(state)
-            raise
+
+        await self.before_loop(state)  # Hook: set up turn state (e.g., initial actor)
+
+        while not await self.is_completed(state):
+            try:
+                prompt_messages = await self.get_prompt_messages(state)
+                if state.get("final_env_response") is not None:
+                    break
+
+                # Hook: get turn-specific sampling args (e.g., per-actor)
+                turn_sampling_args = await self.get_turn_sampling_args(
+                    state, sampling_args or {}
+                )
+
+                response = await self.get_model_response(
+                    state, prompt_messages, sampling_args=turn_sampling_args
+                )
+                await self.add_model_response(state, prompt_messages, response)
+
+                await self.after_turn(state)  # Hook: advance turn state (e.g., next actor)
+
+            except vf.Error as e:
+                if isinstance(e, vf.OverlongPromptError):
+                    state["prompt_too_long"] = True
+                    state["is_truncated"] = True
+                else:
+                    state["error"] = e
+                break
+
+        await self.render_completion(state)
+        return state
