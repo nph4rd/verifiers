@@ -95,7 +95,6 @@ __all__ = [
     "get_model_and_tokenizer",
     "RLTrainer",
     "RLConfig",
-    "MultiAgentOrchestrator",
     "GRPOTrainer",
     "GRPOConfig",
     "grpo_defaults",
@@ -112,7 +111,6 @@ _LAZY_IMPORTS = {
     "get_model_and_tokenizer": "verifiers.rl.trainer.utils:get_model_and_tokenizer",
     "RLConfig": "verifiers.rl.trainer:RLConfig",
     "RLTrainer": "verifiers.rl.trainer:RLTrainer",
-    "MultiAgentOrchestrator": "verifiers.rl.trainer:MultiAgentOrchestrator",
     "GRPOTrainer": "verifiers.rl.trainer:GRPOTrainer",
     "GRPOConfig": "verifiers.rl.trainer:GRPOConfig",
     "grpo_defaults": "verifiers.rl.trainer:grpo_defaults",
@@ -156,7 +154,6 @@ if TYPE_CHECKING:
     from .rl.trainer import (  # noqa: F401
         GRPOConfig,
         GRPOTrainer,
-        MultiAgentOrchestrator,
         RLConfig,
         RLTrainer,
         grpo_defaults,
