@@ -1061,6 +1061,8 @@ class Environment(ABC):
         num_examples: int = -1,
         rollouts_per_example: int = 1,
         max_concurrent: int = -1,
+        max_concurrent_generation: int | None = None,
+        max_concurrent_scoring: int | None = None,
         results_path: Path | None = None,
         state_columns: list[str] | None = None,
         save_results: bool = False,
